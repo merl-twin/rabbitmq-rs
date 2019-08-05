@@ -405,10 +405,10 @@ pub struct Binding {
     routing_key: String,
 }
 impl Binding {
-    pub fn new(exchange: ExchangeConfig, routing: String) -> Binding {
+    pub fn new<S: ToString>(exchange: ExchangeConfig, routing: S) -> Binding {
         Binding {
             exchange: exchange,
-            routing_key: routing,
+            routing_key: routing.to_string(),
         }
     }
 }
