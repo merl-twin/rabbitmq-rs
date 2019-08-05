@@ -1,0 +1,12 @@
+[package]
+name = "rabbitmq-rs"
+version = "0.1.0"
+authors = ["merl <merl.001.mia@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+lapin-futures = "0.14"
+futures = "0.1"
+tokio-core = "0.1"
+log = "0.4"
+
