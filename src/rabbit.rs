@@ -87,14 +87,16 @@ pub struct AmqpHost {
     pub pass: String,
 }
 impl AmqpHost {
-    pub fn create_consumers<F>(self, handle: Handle, consumers: Vec<ConsumerConfig>, handler: &'static F) -> impl Future<Item = (), Error = AmqpError> 
+    pub fn create_consumers<F>(self, handle: Handle, consumers: Vec<ConsumerConfig>, handler: F) -> impl Future<Item = (), Error = AmqpError>
         where F: Fn(AmqpMessage)
     {
+        let sh = Rc::new(handler);
         self.create(handle)
             .and_then(move |(client,heartbeat)| {
+                //let handler = handler;
                 future::join_all(consumers
                                  .into_iter()
-                                 .map(move |con| con.create(&client,handler)))
+                                 .map(move |con| con.create(&client,sh.clone())))
                     .map(|_: Vec<()>| ())
                     .select2(heartbeat)
                     .map(|_| ())
@@ -174,7 +176,7 @@ impl ConsumerConfig {
         self.bindings.push(binding);
         self
     }
-    pub fn create<F>(self, rabbitmq_client: &Client<TcpStream>, handler: &'static F) -> impl Future<Item=(), Error = AmqpError>
+    pub fn create<F>(self, rabbitmq_client: &Client<TcpStream>, handler: Rc<F>) -> impl Future<Item=(), Error = AmqpError>
         where F: Fn(AmqpMessage)
     {
         let con_q = self.queue;
