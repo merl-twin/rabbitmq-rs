@@ -272,9 +272,16 @@ impl AmqpHost {
                                 target: tmp,
                                 error: e,
                             })
-                            .and_then(|sr| match sr.is_some() {
-                                true => future::ok(()),
-                                false => future::err(AmqpError::PublishNotAcked),
+                            .and_then(|sr| {
+                                let confirmed = false;
+                                match match (confirmed,sr) {
+                                    (true,Some(_)) => true,
+                                    (true,None) => false,
+                                    (false,_) => true,
+                                } {
+                                    true => future::ok(()),
+                                    false => future::err(AmqpError::PublishNotAcked),
+                                }
                             })
                     })
                     .select2(heartbeat)
