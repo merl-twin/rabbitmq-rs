@@ -433,7 +433,12 @@ impl ConsumerConfig {
                                                              })
                                                      }))
                                         .and_then(move |vres| {
-                                            match vres.into_iter().fold(true,|acc,x| acc && x.is_some()) {
+                                            let confirmed = false;
+                                            match vres.into_iter().fold(true,move |acc,x| acc && match (confirmed,x) {
+                                                (true,Some(_)) => true,
+                                                (true,None) => false,
+                                                (false,_) => true,
+                                            }) {
                                                 true => future::ok(()),
                                                 false => future::err(AmqpError::PublishNotAcked),
                                             }
@@ -463,7 +468,12 @@ impl ConsumerConfig {
                                                              })
                                                      }))
                                         .and_then(move |vres| {
-                                            match vres.into_iter().fold(true,|acc,x| acc && x.is_some()) {
+                                            let confirmed = false;
+                                            match vres.into_iter().fold(true,move |acc,x| acc && match (confirmed,x) {
+                                                (true,Some(_)) => true,
+                                                (true,None) => false,
+                                                (false,_) => true,
+                                            }) {
                                                 true => future::ok(()),
                                                 false => future::err(AmqpError::PublishNotAcked),
                                             }
