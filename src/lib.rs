@@ -18,6 +18,9 @@ pub use rabbit::{
     CompatMode,
     Publisher,
     FuturePublisher,
+    Posting,
+    SendError,
+    TrySendError,
 };
 
 
