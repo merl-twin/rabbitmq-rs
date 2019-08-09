@@ -104,6 +104,7 @@ pub enum AmqpError {
     AckMessage { queue: String, error: io::Error, },
     RejMessage { queue: String, error: io::Error, },
     Publish { target: String, error: io::Error, },
+    SetConfirm(io::Error),
 }
 
 enum Acknowledgement {
@@ -245,17 +246,32 @@ impl AmqpHost {
     }
     pub fn create_sync_publisher(self, handle: Handle, buffer_size: usize) -> (Publisher, impl Future<Item=(), Error=AmqpError>) {
         let (tx,rx) = fsync::mpsc::channel(buffer_size);
-        (Publisher{ sender: Some(tx) },self.create_publisher(handle,rx))
+        (Publisher{ sender: Some(tx) },self.create_publisher(handle,rx,false))
     }
     pub fn create_async_publisher(self, handle: Handle, buffer_size: usize) -> (FuturePublisher, impl Future<Item=(), Error=AmqpError>) {
         let (tx,rx) = fsync::mpsc::channel(buffer_size);
-        (FuturePublisher{ sender: tx },self.create_publisher(handle,rx))
+        (FuturePublisher{ sender: tx },self.create_publisher(handle,rx,false))
     }
-    fn create_publisher(self, handle: Handle, recv: fsync::mpsc::Receiver<Posting>) -> impl Future<Item=(), Error=AmqpError> {         
+    pub fn create_sync_confirmed_publisher(self, handle: Handle, buffer_size: usize) -> (Publisher, impl Future<Item=(), Error=AmqpError>) {
+        let (tx,rx) = fsync::mpsc::channel(buffer_size);
+        (Publisher{ sender: Some(tx) },self.create_publisher(handle,rx,true))
+    }
+    pub fn create_async_confirmed_publisher(self, handle: Handle, buffer_size: usize) -> (FuturePublisher, impl Future<Item=(), Error=AmqpError>) {
+        let (tx,rx) = fsync::mpsc::channel(buffer_size);
+        (FuturePublisher{ sender: tx },self.create_publisher(handle,rx,true))
+    }
+    fn create_publisher(self, handle: Handle, recv: fsync::mpsc::Receiver<Posting>, confirmed: bool) -> impl Future<Item=(), Error=AmqpError> {         
         self.create(handle)
             .and_then(move |(client,heartbeat)| {
                 client.create_channel()
                     .map_err(AmqpError::CreateChannel)
+                    .and_then(move |channel| match confirmed {
+                        true => Either::A(channel
+                                          .confirm_select(Default::default())
+                                          .map_err(AmqpError::SetConfirm)
+                                          .map(|()| channel)),
+                        false => Either::B(future::ok(channel)),
+                    })
                     .map(move |channel| (channel,heartbeat))
             })
             .and_then(move |(channel,heartbeat)| {
@@ -272,8 +288,7 @@ impl AmqpHost {
                                 target: tmp,
                                 error: e,
                             })
-                            .and_then(|sr| {
-                                let confirmed = false;
+                            .and_then(move |sr| {
                                 match match (confirmed,sr) {
                                     (true,Some(_)) => true,
                                     (true,None) => false,
