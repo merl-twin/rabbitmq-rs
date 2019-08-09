@@ -13,10 +13,12 @@ use lapin::{
 };
 
 use futures::{
+    Sink,
     stream::Stream,
     future::{self, Future, Either},
     IntoFuture,
     sync::oneshot::{self,Canceled},
+    sync as fsync,
 };
 
 use std::rc::Rc;
@@ -50,10 +52,40 @@ impl AmqpMessage {
     }
 }
 
+pub struct AmqpProducingMessage {
+    queue: Arc<String>,
+    data: Vec<u8>,
+    result: oneshot::Sender<PublishingAcknowledgement>,
+}
+impl AmqpProducingMessage {
+    fn new(queue: Arc<String>, data: Vec<u8>) -> (AmqpProducingMessage,impl Future<Item = PublishingAcknowledgement, Error = AmqpError>) {
+        let (tx,rx) = oneshot::channel();
+        (AmqpProducingMessage {
+            queue: queue,
+            data: data,
+            result: tx,
+        }, rx.map_err(|_:Canceled| AmqpError::HandlerCanceled))
+    }
+    pub fn queue(&self) -> &str {
+        &self.queue as &str
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+    pub fn ack(self, msgs: Vec<Posting>) {
+        self.result.send(PublishingAcknowledgement::Ack(msgs)).ok();
+    }
+    pub fn reject(self, msgs: Vec<Posting>) {
+        self.result.send(PublishingAcknowledgement::Reject(msgs)).ok();
+    }
+}
+
 #[derive(Debug)]
 pub enum AmqpError {
     HandlerCanceled,
     NoAddrResolveVariant,
+    PublishNotAcked,
+    PublishReceiver,
     AddrResolve { addr: String, error: io::Error, },
     Heartbeat(io::Error),
     AmqpConnect(io::Error),
@@ -79,6 +111,94 @@ enum Acknowledgement {
     Reject,
 }
 
+enum PublishingAcknowledgement {
+    Ack(Vec<Posting>),
+    Reject(Vec<Posting>),
+}
+
+#[derive(Debug,Clone)]
+pub struct Posting {
+    exchange: String,
+    routing_key: String,
+    data: Vec<u8>,
+}
+impl Posting {
+    pub fn new_exchange_posting(exchange: &str, data: Vec<u8>) -> Posting {
+        Posting {
+            exchange: exchange.to_string(),
+            routing_key: "".to_string(),
+            data: data,
+        }
+    }
+    pub fn new_exchange_key_posting(exchange: &str, routing_key: &str, data: Vec<u8>) -> Posting {
+        Posting {
+            exchange: exchange.to_string(),
+            routing_key: routing_key.to_string(),
+            data: data,
+        }
+    }
+    pub fn new_queue_posting(queue: &str, data: Vec<u8>) -> Posting {
+        Posting {
+            exchange: "".to_string(),
+            routing_key: queue.to_string(),
+            data: data,
+        }
+    }
+}
+
+pub enum SendError {
+    Disconnected(Posting),
+}
+pub enum TrySendError {
+    Confusing(Posting),
+    Full(Posting),
+    Disconnected(Posting),
+}
+
+pub struct Publisher {
+    sender: Option<fsync::mpsc::Sender<Posting>>,
+}
+impl Publisher {
+    pub fn try_send(&mut self, post: Posting) -> Result<(),TrySendError> {
+        match &mut self.sender {
+            Some(sender) => sender.try_send(post)
+                .map_err(|e| {
+                    match (e.is_disconnected(),e.is_full()) {
+                        (true,false) => TrySendError::Full(e.into_inner()),
+                        (false,true) => TrySendError::Disconnected(e.into_inner()),
+                        (false,false) |
+                        (true,true) => TrySendError::Confusing(e.into_inner()), 
+                    }
+                }),
+            None => Err(TrySendError::Disconnected(post)),
+        }
+    }
+    pub fn send(&mut self, post: Posting) -> Result<(),SendError> {
+        match self.sender.take() {
+            Some(sender) => match sender.send(post).wait() {
+                Err(e) => Err(SendError::Disconnected(e.into_inner())),
+                Ok(sender) => {
+                    self.sender = Some(sender);
+                    Ok(())
+                },
+            },
+            None => Err(SendError::Disconnected(post)),
+        }
+    }
+}
+
+pub struct FuturePublisher {
+    sender: fsync::mpsc::Sender<Posting>,
+}
+impl FuturePublisher {
+    pub fn send(self, post: Posting) -> impl Future<Item = FuturePublisher, Error = SendError> {
+        self.sender
+            .send(post)
+            .map(|sender| FuturePublisher{ sender: sender})
+            .map_err(|e| SendError::Disconnected(e.into_inner()))
+    }
+}
+
 #[derive(Debug,Clone)]
 pub struct AmqpHost {
     pub host: String,
@@ -93,7 +213,6 @@ impl AmqpHost {
         let sh = Rc::new(handler);
         self.create(handle)
             .and_then(move |(client,heartbeat)| {
-                //let handler = handler;
                 future::join_all(consumers
                                  .into_iter()
                                  .map(move |con| con.create(&client,sh.clone())))
@@ -106,9 +225,66 @@ impl AmqpHost {
                     })
             })
     }
-    /*pub fn create_publisher(self) -> {
-        
-    }*/
+    pub fn create_publishing_consumers<F>(self, handle: Handle, consumers: Vec<ConsumerConfig>, handler: F) -> impl Future<Item = (), Error = AmqpError>
+        where F: Fn(AmqpProducingMessage)
+    {
+        let sh = Rc::new(handler);
+        self.create(handle)
+            .and_then(move |(client,heartbeat)| {
+                future::join_all(consumers
+                                 .into_iter()
+                                 .map(move |con| con.create_publishing(&client,sh.clone())))
+                    .map(|_: Vec<()>| ())
+                    .select2(heartbeat)
+                    .map(|_| ())
+                    .map_err(|ee| match ee {
+                        Either::A((e,_)) |
+                        Either::B((e,_)) => e,
+                    })
+            })
+    }
+    pub fn create_sync_publisher(self, handle: Handle, buffer_size: usize) -> (Publisher, impl Future<Item=(), Error=AmqpError>) {
+        let (tx,rx) = fsync::mpsc::channel(buffer_size);
+        (Publisher{ sender: Some(tx) },self.create_publisher(handle,rx))
+    }
+    pub fn create_async_publisher(self, handle: Handle, buffer_size: usize) -> (FuturePublisher, impl Future<Item=(), Error=AmqpError>) {
+        let (tx,rx) = fsync::mpsc::channel(buffer_size);
+        (FuturePublisher{ sender: tx },self.create_publisher(handle,rx))
+    }
+    fn create_publisher(self, handle: Handle, recv: fsync::mpsc::Receiver<Posting>) -> impl Future<Item=(), Error=AmqpError> {         
+        self.create(handle)
+            .and_then(move |(client,heartbeat)| {
+                client.create_channel()
+                    .map_err(AmqpError::CreateChannel)
+                    .map(move |channel| (channel,heartbeat))
+            })
+            .and_then(move |(channel,heartbeat)| {
+                recv
+                    .map_err(|()| AmqpError::PublishReceiver)
+                    .for_each(move |p| {
+                        let tmp = format!("{}.{}",p.exchange,p.routing_key);
+                        channel.basic_publish(&p.exchange,
+                                              &p.routing_key,
+                                              p.data,
+                                              Default::default(),
+                                              Default::default())
+                            .map_err(|e| AmqpError::Publish {
+                                target: tmp,
+                                error: e,
+                            })
+                            .and_then(|sr| match sr.is_some() {
+                                true => future::ok(()),
+                                false => future::err(AmqpError::PublishNotAcked),
+                            })
+                    })
+                    .select2(heartbeat)
+                    .map(|_| ())
+                    .map_err(|ee| match ee {
+                        Either::A((e,_)) |
+                        Either::B((e,_)) => e,
+                    })
+            })
+    }
     fn create(self, handle: Handle) -> impl Future<Item = (Client<TcpStream>, impl Future<Item=(), Error=AmqpError>) , Error = AmqpError> {
         let host = self.host.clone();
         (&self.host as &str, self.port)
@@ -175,6 +351,134 @@ impl ConsumerConfig {
     pub fn add_binding(mut self, binding: Binding) -> ConsumerConfig {
         self.bindings.push(binding);
         self
+    }
+    pub fn create_publishing<F>(self, rabbitmq_client: &Client<TcpStream>, handler: Rc<F>) -> impl Future<Item=(), Error = AmqpError>
+        where F: Fn(AmqpProducingMessage)
+    {
+        let con_q = self.queue;
+        let con_binds = self.bindings;
+        let con_tag = self.consumer_tag;
+        let con_opt = self.options;
+        let con_args = self.args;
+        let connect = rabbitmq_client.clone();
+        rabbitmq_client
+            .create_channel()
+            .map_err(AmqpError::CreateChannel)
+            .and_then(move |channel| {
+                connect.create_channel()
+                    .map_err(AmqpError::CreateChannel)
+                    .map(move |pub_channel| (channel,pub_channel))
+            })
+            .and_then({
+                let con_tag = con_tag.clone();
+                move |(channel,pub_channel)| {
+                    info!("channel {} created for consumer: {} [{}]", channel.id, con_q.name, con_tag);
+                    let channel = Rc::new(channel);
+                    match con_binds.len() {
+                        0 => Either::A(con_q.create(channel.clone())),
+                        _ => Either::B(con_q.create_binded(channel.clone(),con_binds)),
+                    }.map(move |queue| (channel,pub_channel,queue))
+                }
+            })
+            .and_then(move |(channel,pub_channel,queue)| {
+                let sh_pub_channel = Rc::new(pub_channel);
+                let sh_con_channel = Rc::new(channel);
+                let q = Arc::new(queue.name());
+                info!("start consuming: {}",q);                        
+                sh_con_channel.clone()
+                    .basic_consume(&queue, &con_tag, con_opt, con_args)
+                    .map_err({
+                        let q = q.clone();
+                        move |e| AmqpError::QueueConsume {
+                            queue: q.to_string(),
+                            error: e,
+                        }
+                    })
+                    .map({
+                        let q = q.clone();
+                        move |stream| stream.map_err(move |e| AmqpError::QueueConsume {
+                            queue: q.to_string(),
+                            error: e,
+                        })
+                    })
+                    .flatten_stream()
+                    .and_then({
+                        let q = q.clone();
+                        move |msg| {
+                            let (am,res) = AmqpProducingMessage::new(q.clone(),msg.data);
+                            let dtag = msg.delivery_tag;
+                            handler(am);
+                            res.map(move |r| (dtag,r))
+                        }
+                    })
+                    .for_each(move |(delivery_tag,result)| {
+                        let pub_channel = sh_pub_channel.clone();
+                        let channel = sh_con_channel.clone();
+                        let q = q.clone();
+                        match result {
+                            PublishingAcknowledgement::Ack(posts) => {
+                                Either::A(
+                                    future::join_all(posts
+                                                     .into_iter()
+                                                     .map(move |p| {
+                                                         let tmp = format!("{}.{}",p.exchange,p.routing_key);
+                                                         pub_channel.basic_publish(&p.exchange,
+                                                                                   &p.routing_key,
+                                                                                   p.data,
+                                                                                   Default::default(),
+                                                                                   Default::default())
+                                                             .map_err(|e| AmqpError::Publish {
+                                                                 target: tmp,
+                                                                 error: e,
+                                                             })
+                                                     }))
+                                        .and_then(move |vres| {
+                                            match vres.into_iter().fold(true,|acc,x| acc && x.is_some()) {
+                                                true => future::ok(()),
+                                                false => future::err(AmqpError::PublishNotAcked),
+                                            }
+                                        })
+                                        .and_then(move |()| {
+                                            channel.basic_ack(delivery_tag,false)
+                                                .map_err({
+                                                    let q = q.clone();
+                                                    move |e| AmqpError::AckMessage { queue: q.to_string(), error: e }
+                                                })
+                                        }))
+                            },
+                            PublishingAcknowledgement::Reject(posts) => {
+                                Either::B(
+                                    future::join_all(posts
+                                                     .into_iter()
+                                                     .map(move |p| {
+                                                         let tmp = format!("{}.{}",p.exchange,p.routing_key);
+                                                         pub_channel.basic_publish(&p.exchange,
+                                                                                   &p.routing_key,
+                                                                                   p.data,
+                                                                                   Default::default(),
+                                                                                   Default::default())
+                                                             .map_err(|e| AmqpError::Publish {
+                                                                 target: tmp,
+                                                                 error: e,
+                                                             })
+                                                     }))
+                                        .and_then(move |vres| {
+                                            match vres.into_iter().fold(true,|acc,x| acc && x.is_some()) {
+                                                true => future::ok(()),
+                                                false => future::err(AmqpError::PublishNotAcked),
+                                            }
+                                        })
+                                        .and_then(move |()| {
+                                            channel.basic_reject(delivery_tag,false)
+                                                .map_err({
+                                                    let q = q.clone();
+                                                    move |e| AmqpError::AckMessage { queue: q.to_string(), error: e }
+                                                })
+                                        }))
+                            },
+                        }
+                    })
+            })
     }
     pub fn create<F>(self, rabbitmq_client: &Client<TcpStream>, handler: Rc<F>) -> impl Future<Item=(), Error = AmqpError>
         where F: Fn(AmqpMessage)

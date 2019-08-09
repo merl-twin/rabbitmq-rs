@@ -16,6 +16,8 @@ pub use rabbit::{
     AmqpError,
     ExchangeType,
     CompatMode,
+    Publisher,
+    FuturePublisher,
 };
 
 
